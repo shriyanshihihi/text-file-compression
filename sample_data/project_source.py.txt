@@ -1,0 +1,485 @@
+"""Custom binary Min-Heap (written from scratch, no `heapq`).
+
+A binary heap is a complete binary tree stored in a plain Python list:
+    parent of index i  -> (i - 1) // 2
+    children of index i -> 2*i + 1  and  2*i + 2
+Rule ("heap property"): every parent is <= its children, so the smallest
+item is always at index 0.
+
+Costs:  push = O(log n)   pop = O(log n)   peek = O(1)
+Why Huffman needs it: at every step we must pull out the TWO smallest-
+frequency nodes. A heap gives that in O(log n) instead of re-sorting (O(n log n))
+or scanning (O(n)) on every step.
+"""
+from __future__ import annotations
+
+
+class MinHeap:
+    """Min-heap of any objects that support the `<` operator."""
+
+    def __init__(self) -> None:
+        self._a: list = []
+
+    def __len__(self) -> int:
+        return len(self._a)
+
+    def peek(self):
+        """Return (without removing) the smallest item. O(1)."""
+        if not self._a:
+            raise IndexError("peek from empty heap")
+        return self._a[0]
+
+    def push(self, item) -> None:
+        """Add an item at the end, then let it float UP to its place. O(log n)."""
+        self._a.append(item)
+        self._sift_up(len(self._a) - 1)
+
+    def pop(self):
+        """Remove and return the smallest item. O(log n).
+
+        Trick: move the LAST item to the root (keeps the tree complete),
+        then let it sink DOWN to its correct position.
+        """
+        a = self._a
+        if not a:
+            raise IndexError("pop from empty heap")
+        smallest = a[0]
+        last = a.pop()
+        if a:                       # heap not empty after removing last item
+            a[0] = last
+            self._sift_down(0)
+        return smallest
+
+    # ---- internal helpers -------------------------------------------------
+    def _sift_up(self, i: int) -> None:
+        a = self._a
+        item = a[i]
+        while i > 0:
+            parent = (i - 1) // 2
+            if item < a[parent]:    # child smaller than parent -> swap upward
+                a[i] = a[parent]
+                i = parent
+            else:
+                break
+        a[i] = item
+
+    def _sift_down(self, i: int) -> None:
+        a = self._a
+        n = len(a)
+        item = a[i]
+        while True:
+            child = 2 * i + 1       # left child
+            if child >= n:
+                break
+            right = child + 1
+            if right < n and a[right] < a[child]:   # pick the smaller child
+                child = right
+            if a[child] < item:     # smaller child beats us -> move it up
+                a[i] = a[child]
+                i = child
+            else:
+                break
+        a[i] = item
+
+"""Huffman tree: node type, frequency counting, tree building, code table,
+and tree (de)serialisation for the file header."""
+from __future__ import annotations
+
+from .bitio import BitReader, BitWriter
+from .min_heap import MinHeap
+
+
+class CorruptFileError(ValueError):
+    """Raised when a compressed file is damaged or not in our format."""
+
+
+class Node:
+    """A tree node. Leaf = has a `symbol` (a byte value 0-255). Internal = has two children."""
+
+    __slots__ = ("freq", "symbol", "left", "right", "order")
+
+    def __init__(self, freq=0, symbol=None, left=None, right=None, order=0):
+        self.freq = freq
+        self.symbol = symbol
+        self.left = left
+        self.right = right
+        self.order = order      # creation counter -> deterministic tie-breaking
+
+    def is_leaf(self) -> bool:
+        return self.left is None and self.right is None
+
+    def __lt__(self, other: "Node") -> bool:
+        # Smaller frequency first; if equal, the older node first.
+        # Without the tie-break, equal-frequency nodes could be merged in a
+        # different order on different runs -> different (but equally optimal) trees.
+        return (self.freq, self.order) < (other.freq, other.order)
+
+
+# --------------------------------------------------------------------------
+# Step 1: count how often each byte occurs            -> O(n)
+# --------------------------------------------------------------------------
+def count_frequencies(data: bytes) -> list:
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
+    return freq
+
+
+# --------------------------------------------------------------------------
+# Step 2: build the tree with the min-heap             -> O(k log k), k = distinct symbols
+# --------------------------------------------------------------------------
+def build_tree(freq: list):
+    """Greedy Huffman: repeatedly merge the two least-frequent nodes."""
+    heap = MinHeap()
+    order = 0
+    for symbol, f in enumerate(freq):
+        if f > 0:
+            heap.push(Node(f, symbol=symbol, order=order))
+            order += 1
+    if len(heap) == 0:
+        return None
+    while len(heap) > 1:
+        first = heap.pop()      # smallest
+        second = heap.pop()     # second smallest
+        heap.push(Node(first.freq + second.freq, left=first, right=second, order=order))
+        order += 1
+    return heap.pop()
+
+
+# --------------------------------------------------------------------------
+# Step 3: walk the tree to get a code for each byte    -> O(k)
+# --------------------------------------------------------------------------
+def build_codes(root) -> dict:
+    """Return {symbol: (code_value, code_length)}. Left edge = 0, right edge = 1."""
+    if root is None:
+        return {}
+    if root.is_leaf():                  # file with only ONE distinct byte
+        return {root.symbol: (0, 1)}    # give it the 1-bit code '0'
+    codes = {}
+    stack = [(root, 0, 0)]              # (node, bits_so_far, length)
+    while stack:
+        node, value, length = stack.pop()
+        if node.is_leaf():
+            codes[node.symbol] = (value, length)
+        else:
+            stack.append((node.right, (value << 1) | 1, length + 1))
+            stack.append((node.left, value << 1, length + 1))
+    return codes
+
+
+def code_string(value: int, length: int) -> str:
+    """Human-readable form, e.g. (5, 3) -> '101'. Used only for display."""
+    return format(value, "0{}b".format(length))
+
+
+# --------------------------------------------------------------------------
+# Step 4: store / restore the tree inside the compressed file
+# --------------------------------------------------------------------------
+def write_tree(root, writer: BitWriter) -> None:
+    """Pre-order walk: internal node -> bit 0 ; leaf -> bit 1 + 8 bits of symbol.
+    Size = (2k - 1) structure bits + 8k symbol bits.  Time O(k)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.is_leaf():
+            writer.write_bit(1)
+            writer.write_bits(node.symbol, 8)
+        else:
+            writer.write_bit(0)
+            stack.append(node.right)    # pushed first -> visited second
+            stack.append(node.left)
+
+
+def read_tree(reader: BitReader):
+    """Rebuild the tree from the bit stream in ONE pass -> O(number of nodes) = O(k).
+    Iterative (explicit stack) so a corrupted file cannot overflow Python's recursion limit."""
+    pending = []                # internal nodes still waiting for children
+    leaves = 0
+    while True:
+        if reader.read_bit() == 1:                      # leaf
+            leaves += 1
+            if leaves > 256:
+                raise CorruptFileError("tree has more than 256 leaves")
+            node = Node(symbol=reader.read_bits(8))
+            while True:                                 # hand the finished node to its parent
+                if not pending:
+                    return node                         # no parent -> this is the root
+                parent = pending[-1]
+                if parent.left is None:
+                    parent.left = node
+                    break
+                parent.right = node
+                pending.pop()
+                node = parent                           # parent is now complete too
+        else:                                           # internal node
+            pending.append(Node())
+
+"""Bit-level I/O. Files store whole bytes, but Huffman codes are 1..N bits long,
+so we need to pack several codes into one byte (and unpack them again)."""
+from __future__ import annotations
+
+
+class BitWriter:
+    """Collects bits and emits full bytes. Last partial byte is zero-padded."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._acc = 0       # bits waiting to be written
+        self._n = 0         # how many bits are waiting (always < 8 between calls)
+
+    def write_bits(self, value: int, length: int) -> None:
+        self._acc = (self._acc << length) | value
+        self._n += length
+        while self._n >= 8:                       # a full byte is ready
+            self._n -= 8
+            self._buf.append((self._acc >> self._n) & 0xFF)
+        self._acc &= (1 << self._n) - 1           # keep only the unwritten bits
+
+    def write_bit(self, bit: int) -> None:
+        self.write_bits(bit, 1)
+
+    def getvalue(self) -> bytes:
+        out = bytearray(self._buf)
+        if self._n:                               # pad the last byte with zeros on the right
+            out.append((self._acc << (8 - self._n)) & 0xFF)
+        return bytes(out)
+
+
+class BitReader:
+    """Reads bits MSB-first from a bytes object, starting at byte offset `start`."""
+
+    def __init__(self, data: bytes, start: int = 0) -> None:
+        self._data = data
+        self._pos = start * 8                     # position in BITS
+        self._end = len(data) * 8
+
+    def read_bit(self) -> int:
+        if self._pos >= self._end:
+            raise EOFError("ran out of bits")
+        byte = self._data[self._pos >> 3]
+        bit = (byte >> (7 - (self._pos & 7))) & 1
+        self._pos += 1
+        return bit
+
+    def read_bits(self, n: int) -> int:
+        value = 0
+        for _ in range(n):
+            value = (value << 1) | self.read_bit()
+        return value
+
+"""High-level compress / decompress + file I/O + statistics.
+
+Compressed file layout (all in one bit stream after a fixed 12-byte header):
+
+    +----------+-----------------+--------------------+---------------------+
+    | "HUF1"   | original length | serialised tree    | encoded data bits   | (+ zero padding)
+    | 4 bytes  | 8 bytes (uint64)| (2k-1) + 8k bits   | sum(freq*codelen)   |
+    +----------+-----------------+--------------------+---------------------+
+
+The ORIGINAL LENGTH tells the decoder exactly when to stop, so the padding
+bits at the end can never be mistaken for data.
+"""
+from __future__ import annotations
+
+import math
+import os
+import struct
+
+from .bitio import BitReader, BitWriter
+from .tree import (CorruptFileError, build_codes, build_tree, code_string,
+                   count_frequencies, read_tree, write_tree)
+
+MAGIC = b"HUF1"
+_HEADER = struct.Struct(">4sQ")      # big-endian: 4-byte magic + unsigned 64-bit length
+
+
+# ---------------------------------------------------------------------------
+# Core: bytes -> bytes
+# ---------------------------------------------------------------------------
+def compress_bytes(data: bytes) -> bytes:
+    header = _HEADER.pack(MAGIC, len(data))
+    if not data:
+        return header
+    root = build_tree(count_frequencies(data))
+    codes = build_codes(root)
+    # Lookup lists are faster than dict lookups in the hot loop.
+    values = [0] * 256
+    lengths = [0] * 256
+    for sym, (val, length) in codes.items():
+        values[sym], lengths[sym] = val, length
+
+    writer = BitWriter()
+    write_tree(root, writer)                       # part 1: the tree
+    for b in data:                                 # part 2: the data, O(n)
+        writer.write_bits(values[b], lengths[b])
+    return header + writer.getvalue()
+
+
+def decompress_bytes(blob: bytes) -> bytes:
+    if len(blob) < _HEADER.size:
+        raise CorruptFileError("file too short to be a Huffman archive")
+    magic, size = _HEADER.unpack_from(blob)
+    if magic != MAGIC:
+        raise CorruptFileError("bad magic number - not a file made by this tool")
+    if size == 0:
+        return b""
+    reader = BitReader(blob, _HEADER.size)
+    try:
+        root = read_tree(reader)                   # rebuild the tree, O(k)
+        if root.is_leaf():                         # only one distinct byte in the original
+            return bytes([root.symbol]) * size
+        out = bytearray()
+        node = root
+        while len(out) < size:                     # walk: 0 = left, 1 = right
+            node = node.right if reader.read_bit() else node.left
+            if node.is_leaf():                     # reached a symbol -> emit, restart at root
+                out.append(node.symbol)
+                node = root
+        return bytes(out)
+    except EOFError:
+        raise CorruptFileError("file is truncated") from None
+
+
+# ---------------------------------------------------------------------------
+# File I/O wrappers
+# ---------------------------------------------------------------------------
+def compress_file(src: str, dst: str) -> None:
+    with open(src, "rb") as f:                     # 'rb' = raw bytes -> works for ANY file type
+        data = f.read()
+    with open(dst, "wb") as f:
+        f.write(compress_bytes(data))
+
+
+def decompress_file(src: str, dst: str) -> None:
+    with open(src, "rb") as f:
+        blob = f.read()
+    with open(dst, "wb") as f:
+        f.write(decompress_bytes(blob))
+
+
+# ---------------------------------------------------------------------------
+# Statistics (used by `stats`, `demo` and the benchmark)
+# ---------------------------------------------------------------------------
+def analyse(data: bytes) -> dict:
+    """Numbers an interviewer may ask about: entropy, average code length, sizes."""
+    n = len(data)
+    if n == 0:
+        return {"n": 0}
+    freq = count_frequencies(data)
+    root = build_tree(freq)
+    codes = build_codes(root)
+    k = len(codes)
+    entropy = -sum((f / n) * math.log2(f / n) for f in freq if f)
+    avg_len = sum(freq[s] * l for s, (_, l) in codes.items()) / n
+    fixed_bits = max(1, math.ceil(math.log2(k)))   # fixed-length code just big enough for k symbols
+    compressed = len(compress_bytes(data))
+    return {
+        "n": n, "distinct": k, "entropy_bits": entropy, "avg_code_len": avg_len,
+        "fixed_bits": fixed_bits, "compressed": compressed,
+        "tree_bytes": math.ceil(((2 * k - 1) + 8 * k) / 8),
+        "reduction_pct": 100.0 * (1 - compressed / n),
+        "ratio": n / compressed,
+        "codes": {s: code_string(v, l) for s, (v, l) in codes.items()},
+        "freq": freq,
+    }
+
+
+def human_symbol(b: int) -> str:
+    return {10: "\\n", 32: "' '", 9: "\\t", 13: "\\r"}.get(b, chr(b) if 33 <= b < 127 else "0x%02X" % b)
+
+#!/usr/bin/env python3
+"""Command-line entry point.
+
+    python main.py demo                      # 2-minute demo (start here)
+    python main.py compress  in.txt out.huf
+    python main.py decompress out.huf back.txt
+    python main.py stats     in.txt          # entropy, avg code length, code table
+"""
+import argparse
+import hashlib
+import os
+import sys
+
+from huffman import (CorruptFileError, analyse, compress_bytes, compress_file,
+                     decompress_bytes, decompress_file)
+from huffman.codec import human_symbol
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def cmd_compress(a):
+    compress_file(a.src, a.dst)
+    o, c = os.path.getsize(a.src), os.path.getsize(a.dst)
+    print("%s: %d -> %d bytes (%.1f%% smaller, ratio %.2fx)" % (a.src, o, c, 100 * (1 - c / o) if o else 0, o / c if c else 0))
+
+
+def cmd_decompress(a):
+    decompress_file(a.src, a.dst)
+    print("restored %s (%d bytes)" % (a.dst, os.path.getsize(a.dst)))
+
+
+def cmd_stats(a):
+    with open(a.src, "rb") as f:
+        data = f.read()
+    s = analyse(data)
+    if not s["n"]:
+        print("empty file"); return
+    print("size %d B | distinct symbols %d | entropy %.3f bits/sym | Huffman avg %.3f bits/sym | fixed-length %d bits/sym"
+          % (s["n"], s["distinct"], s["entropy_bits"], s["avg_code_len"], s["fixed_bits"]))
+    print("compressed %d B (tree/header ~%d B) -> %.1f%% smaller, ratio %.2fx"
+          % (s["compressed"], s["tree_bytes"] + 12, s["reduction_pct"], s["ratio"]))
+    print("\n symbol   freq   code")
+    for sym in sorted(s["codes"], key=lambda x: (len(s["codes"][x]), -s["freq"][x]))[:a.top]:
+        print(" %-7s %6d   %s" % (human_symbol(sym), s["freq"][sym], s["codes"][sym]))
+
+
+def cmd_demo(_):
+    print("=== PART 1: tiny example, so you can SEE the algorithm ===")
+    text = b"abracadabra"
+    s = analyse(text)
+    print("text:", text.decode(), "| 11 chars x 8 bits = 88 bits")
+    for sym in sorted(s["codes"], key=lambda x: len(s["codes"][x])):
+        print("  %s  freq=%d  code=%s" % (chr(sym), s["freq"][sym], s["codes"][sym]))
+    bits = "".join(s["codes"][b] for b in text)
+    print("encoded bits:", bits, "(%d bits)" % len(bits))
+    print("round trip OK:", decompress_bytes(compress_bytes(text)) == text)
+    print("(file is bigger than 11 bytes: header + tree dominate for tiny inputs)\n")
+
+    print("=== PART 2: real(ish) files from sample_data/ ===")
+    d = os.path.join(HERE, "sample_data")
+    out = os.path.join(HERE, "sample_output")
+    os.makedirs(out, exist_ok=True)
+    if not os.path.isdir(d) or not os.listdir(d):
+        sys.exit("sample_data/ is empty - run: python generate_sample_data.py")
+    print("%-18s %9s %11s %9s %7s  lossless" % ("file", "original", "compressed", "smaller", "ratio"))
+    for name in sorted(os.listdir(d)):
+        src = os.path.join(d, name)
+        comp = os.path.join(out, name + ".huf")
+        back = os.path.join(out, name + ".restored")
+        compress_file(src, comp)
+        decompress_file(comp, back)
+        h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+        o, c = os.path.getsize(src), os.path.getsize(comp)
+        print("%-18s %9d %11d %8.1f%% %6.2fx  %s" % (name, o, c, 100 * (1 - c / o), o / c, "YES (SHA-256 match)" if h(src) == h(back) else "NO!!"))
+        os.remove(back)
+    print("\ncompressed files written to sample_output/")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Huffman text file compressor")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, fn in (("compress", cmd_compress), ("decompress", cmd_decompress)):
+        sp = sub.add_parser(name); sp.add_argument("src"); sp.add_argument("dst"); sp.set_defaults(fn=fn)
+    sp = sub.add_parser("stats"); sp.add_argument("src"); sp.add_argument("--top", type=int, default=15); sp.set_defaults(fn=cmd_stats)
+    sp = sub.add_parser("demo"); sp.set_defaults(fn=cmd_demo)
+    a = p.parse_args()
+    try:
+        a.fn(a)
+    except FileNotFoundError as e:
+        sys.exit("error: file not found: %s" % e.filename)
+    except CorruptFileError as e:
+        sys.exit("error: corrupt input: %s" % e)
+
+
+if __name__ == "__main__":
+    main()
