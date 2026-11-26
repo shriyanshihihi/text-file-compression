@@ -1,0 +1,38 @@
+file                         type        original  huffman  smaller   ratio     k  lossless
+apache_license.txt           text           11358     6427    43.4%   1.77x    76       yes
+imagemagick_english.xml      XML            52531    27600    47.5%   1.90x    79       yes
+imagemagick_type_apple.xml   XML            29218    16894    42.2%   1.73x    91       yes
+iso_3166_countries.json      JSON           43284    23986    44.6%   1.80x   108       yes
+iso_4217_currencies.json     JSON           16584     8731    47.4%   1.90x    81       yes
+langtag_currency.xml         XML            22104    12908    41.6%   1.71x    90       yes
+poetry_schema.json           JSON           20636    10601    48.6%   1.95x    72       yes
+python_json_decoder.py       source code    12877     7494    41.8%   1.72x    86       yes
+python_shlex.py              source code    13353     7036    47.3%   1.90x   156       yes
+python_textwrap.py           source code    19958    11164    44.1%   1.79x    88       yes
+
+Average per file type (fixed-length ASCII = 8 bits/char, ratio 1.00x by definition):
+  XML          3 files   43.7% smaller   ratio 1.78x   (zlib, for context only: 6.92x)
+  JSON         3 files   46.9% smaller   ratio 1.88x   (zlib, for context only: 6.82x)
+  source code  3 files   44.4% smaller   ratio 1.80x   (zlib, for context only: 3.63x)
+  text         1 files   43.4% smaller   ratio 1.77x   (zlib, for context only: 2.86x)
+  ALL          10 files   44.8% smaller   ratio 1.82x
+
+Edge cases (compress -> decompress -> identical?):
+  empty file                         PASS
+  one byte                           PASS
+  one repeated symbol                PASS
+  two symbols                        PASS
+  all 256 byte values                PASS
+  random binary 20 KB                PASS
+  UTF-8 text                         PASS
+  deepest tree (Fibonacci counts)    PASS
+  truncated file                     PASS (clear error raised)
+
+================ CV CLAIM CHECK ================
+Implemented Huffman Coding from scratch ....... imports used: os, struct, sys -> PASS
+... via a custom Min-Heap ..................... class MinHeap in huffman.py (push/pop with sift up/down)
+45% average file size reduction ............... measured 44.8% over 10 files -> CONSISTENT
+O(n log n) encoding / O(n) tree rebuild ....... see complexity table in huffman.py; k<=256 distinct bytes, tree has 2k-1 nodes
+100% lossless data recovery across files ...... 10/10 files + 8 edge cases -> PASS
+Benchmarked across XML, JSON & source code .... file types tested: JSON, XML, source code, text -> PASS
+Outperforming fixed-length ASCII by 2x ........ measured 1.82x average ratio -> NOT REACHED (45% smaller = 1.82x; honest wording: about 1.8x)

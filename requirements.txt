@@ -1,3 +1,0 @@
-# No third-party packages are needed: the project uses only the Python standard library (Python 3.8+).
-# Optional, only to re-draw docs/*.png diagrams (not part of the project itself):
-# matplotlib
